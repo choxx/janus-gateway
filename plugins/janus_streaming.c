@@ -205,6 +205,7 @@ void janus_streaming_destroy_session(janus_plugin_session *handle, int *error);
 json_t *janus_streaming_query_session(janus_plugin_session *handle);
 static int janus_streaming_get_fd_port(int fd);
 void *janus_reconnect_rtsp_source(void *);
+void raise_custom_event(const char *, const char *);
 struct  janus_rtsp_source_args {
 	uint64_t id;
 	char *name;
@@ -3232,8 +3233,16 @@ error:
 			json_object_set_new(event, "error", json_string(error_cause));
 			int ret = gateway->push_event(msg->handle, &janus_streaming_plugin, msg->transaction, event, NULL);
 			JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
+			if(notify_events && gateway->events_is_enabled()) {
+				json_t *info = json_object();
+				if(session->mountpoint != NULL)
+					json_object_set_new(info, "id", json_integer(session->mountpoint->id));
+				gateway->notify_event(&janus_streaming_plugin, session->handle, event);
+			}
 			json_decref(event);
 			janus_streaming_message_free(msg);
+
+
 		}
 	}
 	JANUS_LOG(LOG_VERB, "Leaving Streaming handler thread\n");
@@ -3885,6 +3894,17 @@ static int janus_streaming_rtsp_parse_sdp(const char *buffer, const char *name, 
 	return 0;
 }
 
+void raise_custom_event(const char *msg, const char *error) {
+	/* Prepare JSON error event */
+	if(notify_events && gateway != NULL && gateway->events_is_enabled()) {
+		JANUS_LOG(LOG_ERR, "%s : %s\n", msg, error);
+		json_t *event = json_object();
+		json_object_set_new(event, "description", json_string(error));
+		json_object_set_new(event, "message", json_string(msg));
+		gateway->notify_event(&janus_streaming_plugin, NULL, event);
+	}
+}
+
 /* Static helper to connect to an RTSP server, considering we might do this either
  * when creating a new mountpoint, or when reconnecting after some failure */
 static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp) {
@@ -3931,6 +3951,11 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, curldata);
 	int res = curl_easy_perform(curl);
 	if(res != CURLE_OK) {
+		char str[500];
+		strcpy(str, name);
+		strcat(str, " : ");
+		strcat(str, "Couldn't send DESCRIBE request");
+		raise_custom_event(str, curl_easy_strerror(res));
 		JANUS_LOG(LOG_ERR, "Couldn't send DESCRIBE request: %s\n", curl_easy_strerror(res));
 		curl_easy_cleanup(curl);
 		g_free(curldata->buffer);
@@ -3940,12 +3965,25 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	long code = 0;
 	res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 	if(res != CURLE_OK) {
+		char str[500];
+		strcpy(str, name);
+		strcat(str, " : ");
+		strcat(str, "Couldn't send DESCRIBE answer");
+		raise_custom_event(str, curl_easy_strerror(res));
 		JANUS_LOG(LOG_ERR, "Couldn't get DESCRIBE answer: %s\n", curl_easy_strerror(res));
 		curl_easy_cleanup(curl);
 		g_free(curldata->buffer);
 		g_free(curldata);
 		return -3;
 	} else if(code != 200) {
+		char str_code[255];
+		sprintf(str_code, "%ld", code);
+
+		char str[500];
+		strcpy(str, name);
+		strcat(str, " : ");
+		strcat(str, "Couldn't get DESCRIBE code");
+		raise_custom_event(str, str_code);
 		JANUS_LOG(LOG_ERR, "Couldn't get DESCRIBE code: %ld\n", code);
 		curl_easy_cleanup(curl);
 		g_free(curldata->buffer);
@@ -3996,6 +4034,11 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 		curl_easy_setopt(curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_SETUP);
 		res = curl_easy_perform(curl);
 		if(res != CURLE_OK) {
+			char str[500];
+			strcpy(str, name);
+			strcat(str, " : ");
+			strcat(str, "Couldn't send SETUP request");
+			raise_custom_event(str, curl_easy_strerror(res));
 			JANUS_LOG(LOG_ERR, "Couldn't send SETUP request: %s\n", curl_easy_strerror(res));
 			curl_easy_cleanup(curl);
 			g_free(curldata->buffer);
@@ -4023,6 +4066,11 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 		curl_easy_setopt(curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_SETUP);
 		res = curl_easy_perform(curl);
 		if(res != CURLE_OK) {
+			char str[500];
+			strcpy(str, name);
+			strcat(str, " : ");
+			strcat(str, "Couldn't send SETUP request");
+			raise_custom_event(str, curl_easy_strerror(res));
 			JANUS_LOG(LOG_ERR, "Couldn't send SETUP request: %s\n", curl_easy_strerror(res));
 			curl_easy_cleanup(curl);
 			g_free(curldata->buffer);
@@ -4079,6 +4127,7 @@ static int janus_streaming_rtsp_play(janus_streaming_rtp_source *source) {
 	int res = curl_easy_perform(source->curl);
 	if(res != CURLE_OK) {
 		JANUS_LOG(LOG_ERR, "Couldn't send PLAY request: %s\n", curl_easy_strerror(res));
+		raise_custom_event("Couldn't send PLAY request", curl_easy_strerror(res));
 		janus_mutex_unlock(&source->rtsp_mutex);
 		return -1;
 	}
@@ -4563,6 +4612,11 @@ static void *janus_streaming_relay_thread(void *data) {
 				if(janus_streaming_rtsp_connect_to_server(mountpoint) < 0) {
 					/* Reconnection failed? Let's try again later */
 					JANUS_LOG(LOG_WARN, "[%s] Reconnection of the RTSP stream failed, trying again in a few seconds...\n", name);
+					char str[500];
+					strcpy(str, name);
+					strcat(str, " : ");
+					strcat(str, "Reconnection of the RTSP stream failed, trying again in a few seconds...");
+					raise_custom_event(str, " -- ");
 				} else {
 					/* We're connected, let's send a PLAY */
 					if(janus_streaming_rtsp_play(source) < 0) {
@@ -4571,6 +4625,11 @@ static void *janus_streaming_relay_thread(void *data) {
 					} else {
 						/* Everything should be back to normal, let's update the file descriptors */
 						JANUS_LOG(LOG_INFO, "[%s] Reconnected to the RTSP server, streaming again\n", name);
+						char str[500];
+						strcpy(str, name);
+						strcat(str, " : ");
+						strcat(str, "Reconnected to the RTSP server, streaming again");
+						raise_custom_event(str, " -- ");
 						audio_fd = source->audio_fd;
 						video_fd[0] = source->video_fd[0];
 						data_fd = source->data_fd;
@@ -4604,6 +4663,11 @@ static void *janus_streaming_relay_thread(void *data) {
 				resfd = curl_easy_perform(source->curl);
 				if(resfd != CURLE_OK) {
 					JANUS_LOG(LOG_ERR, "[%s] Couldn't send GET_PARAMETER request: %s\n", name, curl_easy_strerror(resfd));
+					char str[500];
+					strcpy(str, name);
+					strcat(str, " : ");
+					strcat(str, "Couldn't send GET_PARAMETER request");
+					raise_custom_event(str, curl_easy_strerror(resfd));
 				}
 				janus_mutex_unlock(&source->rtsp_mutex);
 			}
